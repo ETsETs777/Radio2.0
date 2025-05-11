@@ -1,0 +1,870 @@
+const express = require('express');
+const cors = require('cors');
+const db = require('./db');
+const bcrypt = require('bcrypt');
+const session = require('express-session');
+
+const app = express();
+const PORT = 3001;
+
+// Сессии — должны быть подключены первыми
+app.use(session({
+  secret: 'ваш_секретный_ключ',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: false,
+    httpOnly: true,
+    maxAge: 1000 * 60 * 60 * 24 // 1 день
+  }
+}));
+
+// Middleware
+app.use(cors({
+  origin: 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Глобальная инициализация корзины
+app.use((req, res, next) => {
+  req.session.cart = req.session.cart || [];
+  next();
+});
+
+// === Тестовые маршруты ===
+app.get('/', (req, res) => {
+  res.send('Сервер работает!');
+});
+
+// === Регистрация ===
+app.post('/api/auth/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: 'Не все поля заполнены' });
+  }
+
+  const userExists = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  if (userExists) {
+    return res.status(400).json({ error: 'Пользователь уже существует' });
+  }
+
+  const hashedPassword = await bcrypt.hash(password, 10);
+
+  const stmt = db.prepare(`
+    INSERT INTO users (username, email, password)
+    VALUES (?, ?, ?)
+  `);
+  stmt.run(username, email, hashedPassword);
+
+  res.json({ success: true, message: 'Регистрация успешна' });
+});
+
+// === Вход ===
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({ error: 'Неверные логин или пароль' });
+  }
+
+  req.session.user = {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    wallet: user.wallet
+  };
+
+  res.json({ success: true, user: req.session.user });
+});
+
+// === Получение текущего пользователя ===
+app.get('/api/auth/me', (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ error: 'Пользователь не авторизован' });
+  }
+  res.json(req.session.user);
+});
+
+// === Выход ===
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy(err => {
+    if (err) return res.status(500).json({ error: 'Ошибка выхода' });
+    res.json({ success: true });
+  });
+});
+
+// === Кошелёк ===
+app.get('/api/wallet', (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+
+  const user = db.prepare('SELECT wallet FROM users WHERE id = ?').get(req.session.user.id);
+  res.json({ wallet: user.wallet });
+});
+
+app.post('/api/wallet/add', (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ error: 'Требуется авторизация' });
+  }
+
+  const { amount } = req.body;
+
+  if (!amount || isNaN(amount) || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Укажите корректную сумму' });
+  }
+
+  const userId = req.session.user.id;
+
+  db.prepare(`UPDATE users SET wallet = wallet + ? WHERE id = ?`).run(Number(amount), userId);
+
+  const updatedUser = db.prepare('SELECT id, username, email, wallet FROM users WHERE id = ?').get(userId);
+
+  req.session.user = {
+    ...req.session.user,
+    wallet: updatedUser.wallet
+  };
+
+  res.json({ wallet: updatedUser.wallet });
+});
+
+// === Товары ===
+app.get('/api/products', (req, res) => {
+  const products = db.prepare('SELECT * FROM products').all();
+  res.json(products);
+});
+
+app.get('/api/products/:id', (req, res) => {
+  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+  if (product) {
+    res.json(product);
+  } else {
+    res.status(404).json({ error: 'Товар не найден' });
+  }
+});
+
+app.post('/api/products', (req, res) => {
+  try {
+    const { name, description, price, category, image } = req.body;
+
+    if (!name || !description || !price || !category) {
+      return res.status(400).json({ error: "Не все поля заполнены!" });
+    }
+
+    const stmt = db.prepare(`
+      INSERT INTO products (name, description, price, category, image)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const result = stmt.run(name, description, price, category, image || null);
+
+    res.json({
+      success: true,
+      productId: result.lastInsertRowid,
+      message: "Товар успешно добавлен!"
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === Корзина (для гостей и пользователей) ===
+
+// GET /api/cart — получить корзину
+app.get('/api/cart', (req, res) => {
+  res.json(req.session.cart);
+});
+
+// POST /api/cart/add — добавить товар в корзину
+app.post('/api/cart/add', (req, res) => {
+  const { productId, quantity = 1 } = req.body;
+
+  if (!productId || quantity < 1) {
+    return res.status(400).json({ error: 'Неверные данные' });
+  }
+
+  const product = db.prepare('SELECT id, name, price, image FROM products WHERE id = ?').get(productId);
+  if (!product) {
+    return res.status(404).json({ error: 'Товар не найден' });
+  }
+
+  const existingItem = req.session.cart.find(item => item.id === productId);
+
+  if (existingItem) {
+    existingItem.quantity += quantity;
+  } else {
+    req.session.cart.push({
+      id: product.id,
+      name: product.name,
+      price: product.price,
+      image: product.image,
+      quantity
+    });
+  }
+
+  res.json(req.session.cart);
+});
+
+// POST /api/cart/remove — удалить товар из корзины
+app.post('/api/cart/remove', (req, res) => {
+  const { productId } = req.body;
+
+  if (!productId) {
+    return res.status(400).json({ error: 'ID товара не указан' });
+  }
+
+  req.session.cart = req.session.cart.filter(item => item.id !== productId);
+  res.json(req.session.cart);
+});
+
+// POST /api/cart/update — обновить количество товара
+app.post('/api/cart/update', (req, res) => {
+  const { productId, quantity } = req.body;
+
+  if (!productId || quantity < 1) {
+    return res.status(400).json({ error: 'Неверное количество' });
+  }
+
+  const item = req.session.cart.find(item => item.id === productId);
+  if (item) {
+    item.quantity = quantity;
+  }
+
+  res.json(req.session.cart);
+});
+
+// === Заказы (только для авторизованных) ===
+app.post('/api/orders', (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ error: 'Для оформления заказа необходимо войти' });
+  }
+
+  const { items } = req.body;
+
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Корзина пуста' });
+  }
+
+  const totalPrice = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+
+  const insertOrder = db.prepare(`
+    INSERT INTO orders (customer_name, customer_email, customer_phone, total_price)
+    VALUES (?, ?, ?, ?)
+  `).run(
+    req.session.user.username,
+    req.session.user.email,
+    "Не указано",
+    totalPrice
+  );
+
+  const orderId = insertOrder.lastInsertRowid;
+
+  const insertItem = db.prepare(`
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  const insertItems = db.transaction(() => {
+    for (const item of items) {
+      insertItem.run(orderId, item.id, item.quantity, item.price);
+    }
+  });
+
+  insertItems();
+
+  // Очистка корзины
+  req.session.cart = [];
+
+  res.json({
+    success: true,
+    orderId,
+    totalPrice
+  });
+});
+
+// === Запуск сервера ===
+app.listen(PORT, () => {
+  console.log(`Сервер запущен на http://localhost:${PORT}`);
+});
+import React, { useEffect, useState } from "react";
+import Cart from "../components/Cart"; // Это твой компонент корзины
+
+const CartPage = () => {
+  const [cart, setCart] = useState([]);
+  const [user, setUser] = useState(null); // Можно получать из контекста или localStorage
+
+  // Получаем данные пользователя
+  useEffect(() => {
+    fetch("http://localhost:3001/api/auth/me", {
+      credentials: "include"
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (!data.error) {
+          setUser(data);
+        }
+      });
+  }, []);
+
+  // Получаем корзину с сервера при загрузке страницы
+  useEffect(() => {
+    fetch("http://localhost:3001/api/cart", {
+      credentials: "include"
+    })
+      .then(res => res.json())
+      .then(data => {
+        setCart(data || []);
+      })
+      .catch(err => {
+        console.error("Ошибка загрузки корзины:", err);
+        setCart([]);
+      });
+  }, []);
+
+  // Удаление товара
+  const removeFromCart = (productId) => {
+    fetch("http://localhost:3001/api/cart/remove", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ productId }),
+      credentials: "include"
+    })
+      .then(res => res.json())
+      .then(updatedCart => {
+        setCart(updatedCart);
+      })
+      .catch(err => {
+        alert("Не удалось удалить товар");
+        console.error(err);
+      });
+  };
+
+  // Обновление количества
+  const updateQuantity = (productId, quantity) => {
+    if (quantity < 1) return;
+
+    fetch("http://localhost:3001/api/cart/update", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ productId, quantity }),
+      credentials: "include"
+    })
+      .then(res => res.json())
+      .then(updatedCart => {
+        setCart(updatedCart);
+      })
+      .catch(err => {
+        alert("Не удалось обновить количество");
+        console.error(err);
+      });
+  };
+
+  // Оформление заказа
+  const handleCheckout = () => {
+    fetch("http://localhost:3001/api/orders", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ items: cart }),
+      credentials: "include"
+    })
+      .then(res => res.json())
+      .then(data => {
+        alert("Заказ оформлен!");
+        setCart([]); // Очистка локальной корзины
+      })
+      .catch(err => {
+        alert("Ошибка оформления заказа");
+        console.error(err);
+      });
+  };
+
+  return (
+    <div className="container mt-5">
+      <h2 className="mb-4">Корзина</h2>
+
+      <Cart
+        cartItems={cart}
+        onRemoveFromCart={removeFromCart}
+        onUpdateQuantity={updateQuantity}
+      />
+
+      {cart.length > 0 && (
+        <button className="btn btn-success w-100 mt-3" onClick={handleCheckout}>
+          Оформить заказ
+        </button>
+      )}
+    </div>
+  );
+};
+
+export default CartPage
+import React from 'react';
+import { FaTrash } from 'react-icons/fa';
+import { useNavigate } from 'react-router-dom';
+
+const Cart = ({ cartItems, onRemoveFromCart, onUpdateQuantity }) => {
+  const navigate = useNavigate();
+
+  const totalPrice = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+
+  const handleCheckout = () => {
+    if (cartItems.length === 0) {
+      alert("Корзина пуста");
+      return;
+    }
+
+    navigate('/checkout');
+  };
+
+  return (
+    <div className="cart">
+      <h3>Ваша корзина</h3>
+      {cartItems.length === 0 ? (
+        <p>Корзина пуста</p>
+      ) : (
+        <>
+          <div className="list-group mb-3">
+            {cartItems.map((item) => (
+              <div key={item.id} className="list-group-item d-flex justify-content-between align-items-center">
+                <div className="d-flex align-items-center gap-3">
+                  <img 
+                    src={item.image || 'https://via.placeholder.com/50  '} 
+                    alt={item.name} 
+                    width="50" 
+                    className="img-thumbnail"
+                  />
+                  <div>
+                    <h6 className="mb-0">{item.name}</h6>
+                    <small>{item.price.toLocaleString()} ₽</small>
+                  </div>
+                </div>
+                <div className="d-flex align-items-center gap-2">
+                  <input 
+                    type="number" 
+                    min="1" 
+                    value={item.quantity} 
+                    onChange={(e) => onUpdateQuantity(item.id, parseInt(e.target.value))}
+                    className="form-control form-control-sm" 
+                    style={{ width: '60px' }}
+                  />
+                  <button 
+                    className="btn btn-danger btn-sm"
+                    onClick={() => onRemoveFromCart(item.id)}
+                  >
+                    <FaTrash />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="d-flex justify-content-between align-items-center mt-3">
+            <h5>Итого: {totalPrice.toLocaleString()} ₽</h5>
+            <button 
+              className="btn btn-success"
+              onClick={handleCheckout}
+            >
+              Оформить заказ
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+export default Cart;
+const Database = require('better-sqlite3')
+
+const db = new Database('database.db', { verbose: console.log })
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    wallet REAL DEFAULT 0.0
+  );
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    price REAL NOT NULL,
+    image TEXT,
+    category TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_name TEXT NOT NULL,
+    customer_email TEXT NOT NULL,
+    customer_phone TEXT NOT NULL,
+    total_price REAL NOT NULL,
+    status TEXT DEFAULT 'new',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(id),
+    FOREIGN KEY (product_id) REFERENCES products(id)
+  );
+`)
+
+const productCount = db.prepare('SELECT COUNT(*) as count FROM products').get().count
+if (productCount === 0) {
+  const insert = db.prepare(`
+    INSERT INTO products (name, description, price, image, category) 
+    VALUES (?, ?, ?, ?, ?)
+  `)
+
+  const products = [
+    {
+      name: 'Ардуино Уно R3',
+      description: 'Микроконтроллерная плата на базе ATmega328P',
+      price: 1200,
+      image: 'https://example.com/arduino.jpg',
+      category: 'Микроконтроллеры'
+    },
+    {
+      name: 'Raspberry Pi 4 Model B 4GB',
+      description: 'Одноплатный компьютер с 4 ГБ оперативной памяти',
+      price: 6500,
+      image: 'https://example.com/raspberry.jpg',
+      category: 'Одноплатные компьютеры'
+    },
+    {
+      name: 'Паяльник 60W',
+      description: 'Паяльник с регулировкой температуры',
+      price: 1500,
+      image: 'https://example.com/soldering.jpg',
+      category: 'Инструменты'
+    },
+    {
+      name: 'Набор резисторов 500 шт',
+      description: 'Набор резисторов различных номиналов',
+      price: 300,
+      image: 'https://example.com/resistors.jpg',
+      category: 'Компоненты'
+    },
+    {
+      name: 'Мультиметр DT-830B',
+      description: 'Цифровой мультиметр с базовыми функциями',
+      price: 800,
+      image: 'https://example.com/multimeter.jpg',
+      category: 'Измерительные приборы'
+    },
+    {
+      "name": "Arduino Uno R3",
+      "description": "Популярная плата для начинающих и профи",
+      "price": 1200,
+      "image": "https://www.oldi.ru/image/cache/products/104675_1-600x600.jpg",
+      "category": "Микроконтроллеры"
+    },
+    {
+        "name": "Raspberry Pi 4 Model B 8GB",
+        "description": "Одноплатный компьютер с 8 ГБ оперативной памяти",
+        "price": 8900,
+        "image": "https://www.oldi.ru/image/cache/products/136139_1-600x600.jpg",
+        "category": "Одноплатные компьютеры"
+    },
+      {
+        "name": "ESP32 DevKit V1",
+        "description": "Wi-Fi и Bluetooth модуль для IoT проектов",
+        "price": 890,
+        "image": "https://www.oldi.ru/image/cache/products/120514_1-600x600.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "DS18B20 Датчик температуры",
+        "description": "Цифровой датчик температуры с интерфейсом 1-Wire",
+        "price": 150,
+        "image": "https://radiodetali.ru/upload/iblock/e5c/e5c8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "HC-SR04 Ультразвуковой датчик",
+        "description": "Измеритель расстояния до 4 метров",
+        "price": 250,
+        "image": "https://radiodetali.ru/upload/iblock/f1a/f1a2e3f5a4d1c3e6d2e1f7a5d2e3b7e7.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "LCD1602 с I2C адаптером",
+        "description": "ЖК-дисплей 16x2 символа с модулем I2C",
+        "price": 350,
+        "image": "https://www.oldi.ru/image/cache/products/115285_1-600x600.jpg",
+        "category": "Дисплеи"
+      },
+      {
+        "name": "Светодиод RGB 5мм",
+        "description": "Многоцветный светодиод с общим анодом",
+        "price": 20,
+        "image": "https://radiodetali.ru/upload/iblock/d41/d41f1e2a5d3c4b6e7f1a2e3d5f6c7b8a.jpg",
+        "category": "Компоненты"
+      },
+      {
+        "name": "Реле 5В 1 канал",
+        "description": "Одноканальное реле для коммутации нагрузки",
+        "price": 120,
+        "image": "https://www.oldi.ru/image/cache/products/108237_1-600x600.jpg",
+        "category": "Электромеханика"
+      },
+      {
+        "name": "Драйвер L298N",
+        "description": "Драйвер двигателей постоянного тока",
+        "price": 400,
+        "image": "https://www.oldi.ru/image/cache/products/108332_1-600x600.jpg",
+        "category": "Моторы и драйверы"
+      },
+      {
+        "name": "Li-Ion аккумулятор 18650",
+        "description": "Перезаряжаемый литиевый аккумулятор 3.7В",
+        "price": 250,
+        "image": "https://radiodetali.ru/upload/iblock/1c0/1c0a5e7d2f3c1b4e8a6f1c0d5e2b7a9f.jpg",
+        "category": "Источники питания"
+      },
+      {
+        "name": "Мультиметр DT-830B",
+        "description": "Цифровой мультиметр с базовыми функциями",
+        "price": 800,
+        "image": "https://radiodetali.ru/upload/iblock/4f4/4f41a3c1d2e5f6b7a4c8d9e0f1a2b3c4.jpg",
+        "category": "Измерительные приборы"
+      },
+      {
+        "name": "Паяльник 60W",
+        "description": "Паяльник с регулировкой температуры",
+        "price": 1500,
+        "image": "https://www.oldi.ru/image/cache/products/111563_1-600x600.jpg",
+        "category": "Инструменты"
+      },
+      {
+        "name": "Набор отверток SL/PH",
+        "description": "Комплект мини-отверток для электроники",
+        "price": 300,
+        "image": "https://www.oldi.ru/image/cache/products/111563_1-600x600.jpg",
+        "category": "Инструменты"
+      },
+      {
+        "name": "Транзистор 2N2222",
+        "description": "NPN биполярный транзистор",
+        "price": 15,
+        "image": "https://radiodetali.ru/upload/iblock/7d7/7d7e1f2a5c3b4d6e8f1a2c5d4e3b7a9f.jpg",
+        "category": "Компоненты"
+      },
+      {
+        "name": "Конденсатор электролитический 100мкФ",
+        "description": "Конденсатор полярный на 16В",
+        "price": 25,
+        "image": "https://radiodetali.ru/upload/iblock/8c8/8c8e1f2a5c3b4d6e8f1a2c5d4e3b7a9f.jpg",
+        "category": "Компоненты"
+      },
+      {
+        "name": "Резистор 1 кОм 0.25 Вт",
+        "description": "Углеродный резистор",
+        "price": 5,
+        "image": "https://radiodetali.ru/upload/iblock/a1a/a1a2e3f5a4d1c3e6d2e1f7a5d2e3b7e7.jpg",
+        "category": "Компоненты"
+      },
+      {
+        "name": "USB to TTL конвертер CH340",
+        "description": "Адаптер для программирования Arduino Mini",
+        "price": 300,
+        "image": "https://www.oldi.ru/image/cache/products/111563_1-600x600.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль SD-карты",
+        "description": "Модуль для чтения данных с SD карт",
+        "price": 400,
+        "image": "https://radiodetali.ru/upload/iblock/c3c/c3c8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Хранение данных"
+      },
+      {
+        "name": "Модуль RTC DS3231",
+        "description": "Часы реального времени с питанием от батарейки",
+        "price": 350,
+        "image": "https://radiodetali.ru/upload/iblock/d5d/d5d8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули"
+      },
+      {
+        "name": "Микросхема AT24C32",
+        "description": "EEPROM память 32Кбит",
+        "price": 100,
+        "image": "https://radiodetali.ru/upload/iblock/e6e/e6e8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Компоненты"
+      },
+      {
+        "name": "Датчик движения HC-SR501",
+        "description": "Пироэлектрический датчик движения",
+        "price": 200,
+        "image": "https://radiodetali.ru/upload/iblock/f7f/f7f8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Модуль микрофона KY-038",
+        "description": "Аналоговый и цифровой выход звука",
+        "price": 150,
+        "image": "https://radiodetali.ru/upload/iblock/0a0/0a08e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули"
+      },
+      {
+        "name": "Модуль вибрации KY-002",
+        "description": "Модуль обнаружения вибрации",
+        "price": 120,
+        "image": "https://radiodetali.ru/upload/iblock/1b1/1b18e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули"
+      },
+      {
+        "name": "Модуль управления сервоприводами PCA9685",
+        "description": "Широтно-импульсная модуляция для 16 сервоприводов",
+        "price": 500,
+        "image": "https://www.oldi.ru/image/cache/products/120514_1-600x600.jpg",
+        "category": "Модули"
+      },
+      {
+        "name": "Гироскоп MPU6050",
+        "description": "Модуль измерения угла наклона и вращения",
+        "price": 300,
+        "image": "https://radiodetali.ru/upload/iblock/2c2/2c28e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Датчик света GL5528",
+        "description": "Фоторезистор для определения уровня освещенности",
+        "price": 80,
+        "image": "https://radiodetali.ru/upload/iblock/3d3/3d38e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Датчик давления BMP180",
+        "description": "Модуль измерения давления и температуры",
+        "price": 450,
+        "image": "https://radiodetali.ru/upload/iblock/4e4/4e48e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Датчик газа MQ-2",
+        "description": "Датчик детектирования газа, дыма и пара",
+        "price": 200,
+        "image": "https://radiodetali.ru/upload/iblock/5f5/5f58e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Модуль NFC RC522",
+        "description": "Чтение и запись RFID-карт формата 13.56 МГц",
+        "price": 400,
+        "image": "https://radiodetali.ru/upload/iblock/6a6/6a68e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Датчик цвета TCS3200",
+        "description": "Модуль определения цвета объектов",
+        "price": 600,
+        "image": "https://radiodetali.ru/upload/iblock/7b7/7b78e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Датчик влажности DHT11",
+        "description": "Цифровой датчик температуры и влажности",
+        "price": 180,
+        "image": "https://radiodetali.ru/upload/iblock/8c8/8c88e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Датчики"
+      },
+      {
+        "name": "Модуль Wi-Fi ESP-01",
+        "description": "Мини модуль Wi-Fi для подключения к сети",
+        "price": 350,
+        "image": "https://www.oldi.ru/image/cache/products/120514_1-600x600.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль GPS NEO-6M",
+        "description": "GPS приемник для определения координат",
+        "price": 1200,
+        "image": "https://radiodetali.ru/upload/iblock/9d9/9d98e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль Bluetooth HC-05",
+        "description": "Модуль беспроводной передачи данных по Bluetooth",
+        "price": 450,
+        "image": "https://radiodetali.ru/upload/iblock/a1a/a1a8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль LoRa SX1278",
+        "description": "Модуль дальней связи на основе технологии LoRa",
+        "price": 700,
+        "image": "https://radiodetali.ru/upload/iblock/b2b/b2b8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль GSM SIM800L",
+        "description": "GSM модуль для отправки SMS и голосовых вызовов",
+        "price": 1200,
+        "image": "https://radiodetali.ru/upload/iblock/c3c/c3c8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль ZigBee XBee",
+        "description": "Модуль беспроводной связи стандарта ZigBee",
+        "price": 1500,
+        "image": "https://radiodetali.ru/upload/iblock/d4d/d4d8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули связи"
+      },
+      {
+        "name": "Модуль CAN MCP2515",
+        "description": "Контроллер шины CAN для автомобильных систем",
+        "price": 500,
+        "image": "https://radiodetali.ru/upload/iblock/e5e/e5e8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули"
+      },
+      {
+        "name": "Модуль IR-приемника VS1838B",
+        "description": "Приемник инфракрасного сигнала",
+        "price": 100,
+        "image": "https://radiodetali.ru/upload/iblock/f6f/f6f8e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули"
+      },
+      {
+        "name": "Модуль MAX7219 для светодиодных матриц",
+        "description": "Драйвер управления 8x8 светодиодными матрицами",
+        "price": 300,
+        "image": "https://radiodetali.ru/upload/iblock/0a0/0a08e1f7a5d2e3b7e7f6d1c6a3e4d8f2.jpg",
+        "category": "Модули"
+      }
+    ]
+
+  const insertMany = db.transaction((products) => {
+    for (const product of products) {
+      insert.run(
+        product.name,
+        product.description,
+        product.price,
+        product.image,
+        product.category
+      )
+    }
+  })
+
+  insertMany(products)
+}
+
+module.exports = db
